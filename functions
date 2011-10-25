@@ -1,0 +1,356 @@
+#!/bin/bash
+#-------------------------------------------------------------------------
+#  Copyright 2007, NETGEAR
+#  All rights reserved.
+#-------------------------------------------------------------------------
+
+FS='!!'
+FRONTVIEW_HOME=/frontview
+CONF_PATH=/etc/frontview
+LOG_PATH=/var/log/frontview
+SPOOL_PATH=/var/spool/frontview
+LOGFILE=$LOG_PATH/status.log-new
+SYNC_LOGFILE=$LOG_PATH/status.log-sync
+LVMBIN=/sbin
+FTP_HOME=/home/ftp
+DISK_CONF=$CONF_PATH/disk.conf
+SERVICES=/etc/default/services
+TZ=:/etc/localtime
+
+export PATH=$LVMBIN:$PATH:$FRONTVIEW_HOME/bin:/sbin:/usr/sbin
+. /etc/default/services
+
+log_status() {
+  time=`date`
+  status=$1
+  severity=$2
+  user=`id -un`
+
+  echo "${severity}${FS}${time}${FS}${user}${FS}${status}" >> $LOGFILE
+  chown admin.admin $LOGFILE
+}
+
+sync_log_status() {
+  status=$1
+  status_message=$2
+  severity=$3
+  time=`date`
+  user=`id -un`
+   
+  echo "${status}${FS}${severity}${FS}${time}${FS}${user}${FS}${status_message}" >> $SYNC_LOGFILE
+  chown admin.admin $SYNC_LOGFILE
+}
+
+remove_volume_status() {
+  echo "rm -f $LOG_PATH/Volume_*.log" >> $SPOOL_PATH/.Volume
+}
+
+disk_add() {
+  hd=$1
+  if [ -f $DISK_CONF ]; then
+    grep -v $hd $DISK_CONF > /tmp/disk.conf$$
+    cp /tmp/disk.conf$$ $DISK_CONF
+    rm -f /tmp/disk.conf$$
+  fi
+  echo "$hd:1" >> $DISK_CONF
+}
+
+disk_remove() {
+  hd=$1
+  if [ -f $DISK_CONF ]; then
+    grep -v $hd $DISK_CONF > /tmp/disk.conf$$
+    cp /tmp/disk.conf$$ $DISK_CONF
+    rm -f /tmp/disk.conf$$
+  fi
+  echo "$hd:0" >> $DISK_CONF
+}
+
+send_email_alert() {
+  subject=$1
+  mesg=$2
+  user=$3
+  language=$4
+  trapoid=$5
+  mesgoid=$6
+
+  if [ ! -f $CONF_PATH/alert.conf ]; then
+    return
+  fi
+
+  hostname=`hostname --short`
+  subject="$subject ($hostname)"
+
+  email_addr=`grep email $CONF_PATH/alert.conf | awk -F '!!' '{ print $2 }' | awk -F ',' '{ print $1 " " $2 " " $3 }'`
+  
+  if [ -z "$email_addr" ]; then
+    return -1
+  else
+    if [ $(readlink `which sendmail`) = "/usr/bin/msmtp" ]; then
+      email_from=$(grep '^from' /etc/msmtprc | cut -f2 -d' ')
+      headers="From: $email_from\nTo: $email_addr\n"
+    else
+      email_from=`echo $email_addr | awk '{ print $1 }'`
+    fi
+  fi
+
+  if [ -z "$language" ]; then
+    lang=$LANGUAGE
+  else
+    lang=$language
+  fi
+  if [ "$lang" = "ja" ]; then
+    ICONV=" | iconv -c -f UTF-8 -t ISO-2022-JP"
+    subject="=?iso-2022-jp?B?$(echo -n -e $subject | iconv -c -f UTF-8 -t ISO-2022-JP | base64)?="
+    content="MIME-Version: 1.0\nContent-Type: Text/Plain; charset=ISO-2022-JP\nContent-Transfer-Encoding: 8bit"
+    full_content=$(echo -e "${headers}Subject: ${subject}\n${content}\n\n$mesg" | iconv -c -f UTF-8 -t ISO-2022-JP)
+    echo "$full_content" | /usr/sbin/sendmail -B8BITMIME -f $email_from $user $email_addr &> /dev/null
+  else
+    if [ "$lang" != "en-us" ]; then
+      subject="=?utf-8?B?$(echo -n -e $subject | base64)?="
+      content="MIME-Version: 1.0\nContent-Type: Text/Plain; charset=UTF-8\nContent-Transfer-Encoding: 8bit"
+    elif [ "X$ALLOW_UTF8_NAMES" = "X1" ]; then
+      # content may contains utf-8 char, so that better to specify charset
+      content="MIME-Version: 1.0\nContent-Type: Text/Plain; charset=UTF-8\nContent-Transfer-Encoding: 8bit"
+    fi
+    full_content="${headers}Subject: ${subject}\n${content}\n\n$mesg"
+    echo -e "$full_content" | /usr/sbin/sendmail -B8BITMIME -f $email_from $user $email_addr &> /dev/null
+  fi
+  result=$?
+
+  send_snmp_trap "$trapoid" "$mesgoid" "$mesg"
+
+  # send to syslogd 
+  if [ -n "$trapoid" -a -n "$mesgoid" ]; then
+    raidiator-syslog 5 "$mesg"
+  fi
+
+  return $result
+}
+
+
+function send_snmp_trap()
+{
+  trapoid=$1
+  mesgoid=$2
+  mesg=$3
+
+  if [ "$SNMPD" = "1" ]; then
+    trapComm=`grep -i trapcommunity /etc/snmp/snmpd.conf | awk '{print $2 }'`
+    trapDes=`grep -i trap2sink /etc/snmp/snmpd.conf | awk '{ print $2 }'`
+    if [ -z "$trapComm" ]; then
+       trapComm="public"
+    fi
+    if [ -z "$trapDes" ]; then
+       trapDes="localhost"
+    fi 
+  
+    if [ -n "$trapoid" -a -n "$mesgoid" ]; then
+      snmptrap -v 2c -c $trapComm $trapDes '' $trapoid $mesgoid s "$mesg"
+    fi
+  fi
+}
+
+
+#---------------------------------------------------------------
+# By default, wait up to 2 minutes for lock to clear.  If
+# parameters are given, wait up to $2 seconds and check for
+# cleared lock every $3 seconds.
+#---------------------------------------------------------------
+function acquire_lock()
+{
+  name=$1
+  maxtime=$2
+  checkinterval=$3
+
+  i=0
+  
+  if [ -z $maxtime ] ; then
+    maxtime=120
+  fi
+
+  if [ -z $checkinterval ] ; then
+    checkinterval=1
+  fi
+  
+  while [ $i -lt $maxtime ]; do
+    if [ -e $LOG_PATH/LCK_${name} ]; then
+      sleep $checkinterval
+      i=$(($i+$checkinterval))
+    else
+      echo $$ > $LOG_PATH/LCK_${name}
+      if [ `cat $LOG_PATH/LCK_${name}` = "$$" ]; then
+        break
+      fi
+    fi
+  done
+}
+
+function release_lock()
+{
+  name=$1
+
+  rm -f $LOG_PATH/LCK_${name}
+}
+
+function modify_user_homedir
+{
+  from_path=$1
+  to_path=$2
+
+  if grep -q ":${from_path}.*:/bin/false" /etc/passwd; then
+    grep -v ":${from_path}.*:/bin/false" /etc/passwd > /tmp/passwd.ok
+    
+    if grep -q "home_volume" /etc/frontview/account.conf; then
+      home_path="/`awk -F "!!" '/home_volume/ {print tolower($2)}' /etc/frontview/account.conf`/home"
+    fi
+  
+    grep ":${from_path}.*:/bin/false" /etc/passwd | awk -F : '{print $1 ":" $2 ":" $3 ":" $4 ":" $5 ":" to_path "/" $1 ":" $7}' to_path=$to_path >> /tmp/passwd.ok
+    cp /tmp/passwd.ok /etc/passwd
+    hwencrypt /etc/passwd /etc/passwd.enc &>/dev/null
+    rm -f /tmp/passwd.ok
+  fi
+
+  if [ -d /homes ]; then
+    rm -f /homes
+    if [ -d $to_path ]; then
+      ln -s $to_path /homes
+    fi
+  fi
+}
+
+# 1 for enable, 0 for disable
+function set_disk_write_cache()
+{
+  for i in `grep " 0 .*hd[c-z]" /proc/partitions | awk '{ print $4 }'`; do
+    hdparm -qW$1 /dev/$i
+  done
+  cp -a $SERVICES $SERVICES.1
+}
+
+function set_fan_speed_high()
+{
+  if ! grep -q "^ASIC.*: IT1004" /proc/cpuinfo; then
+    return
+  fi
+
+  touch /.autofan_override
+
+#  use hard link as is
+#  echo 255 > /proc/sys/dev/hwmon/fan2_speed_control
+
+  if [ -e /proc/sys/dev/hwmon/fan2_speed_control ]; then
+     echo 255 > /proc/sys/dev/hwmon/fan2_speed_control
+  else
+     if [ -e /proc/sys/dev/hwmon/fan0_speed_control ]; then
+         echo 255 > /proc/sys/dev/hwmon/fan0_speed_control
+     fi
+     if [ -e /proc/sys/dev/hwmon/fan1_speed_control ]; then
+         echo 255 > /proc/sys/dev/hwmon/fan1_speed_control
+     fi
+  fi
+}
+
+function set_fan_speed_auto()
+{
+  if ! grep -q "^ASIC.*: IT1004" /proc/cpuinfo; then
+    return
+  fi
+
+  rm -f /.autofan_override
+  rm -f $CONF_PATH/fan_setting_*
+}
+
+function get_language_strings()
+{
+  language=`grep LANGUAGE= $SERVICES | cut -d= -f2`
+  if [ -r $FRONTVIEW_HOME/bin/lang/en-us/strings ]; then
+    source $FRONTVIEW_HOME/bin/lang/en-us/strings
+  fi
+  if [ "$language" != "en-us" ]; then
+    if [ -r $FRONTVIEW_HOME/bin/lang/$language/strings ]; then
+      source $FRONTVIEW_HOME/bin/lang/$language/strings
+    fi
+  fi
+}
+
+function expand_string()
+{
+  STRING=$(echo "$1" | sed 's/%%/\$/g ; s/\\n/\\\\n/g')
+  EXPANDED_STRING=$(eval echo "$STRING")
+}
+
+function turnon_lcd()
+{
+  if [ "$MACHTYPE" = "sparc-unknown-linux-gnu" ]; then
+    if [ -e /proc/sys/dev/lcd/cmd ]; then
+      echo 1 > /proc/sys/dev/lcd/backlight
+    fi
+  else
+    echo "D 1" > /sys/devices/system/nv6_lcd/nv6_lcd0/cmd
+  fi
+}
+
+function turnoff_lcd()
+{
+  if [ "$MACHTYPE" = "sparc-unknown-linux-gnu" ]; then
+    if [ -e /proc/sys/dev/lcd/cmd ]; then
+      echo 0 > /proc/sys/dev/lcd/backlight
+    fi
+  else
+    echo "D 0" > /sys/devices/system/nv6_lcd/nv6_lcd0/cmd
+  fi
+}
+
+function toggle_lcd_backlight()
+{
+  if [ -e /proc/sys/dev/lcd/cmd ]; then
+    if [ `cat /proc/sys/dev/lcd/backlight` = "1" ]; then
+      echo 0 > /proc/sys/dev/lcd/backlight
+    else
+      echo 1 > /proc/sys/dev/lcd/backlight
+    fi
+  fi
+}
+
+function print_lcd_line()
+{
+  line=$1
+
+  if [ "$MACHTYPE" = "sparc-unknown-linux-gnu" ]; then
+    if [ -e /proc/sys/dev/lcd/cmd ]; then
+      if [ "$line" = "2" ]; then
+        line=192
+      elif [ "$line" = "1" ]; then
+        line=2
+      fi
+      echo 1 > /proc/sys/dev/lcd/backlight
+      echo $line > /proc/sys/dev/lcd/cmd
+      printf "%-16.16s" "$2" > /dev/lcd
+    fi
+  else
+    turnon_lcd
+    if [ "$line" = "2" ]; then
+      line="Y"
+    elif [ "$line" = "1" ]; then
+      line="X"
+    fi
+    printf "$line %-18.18s" "$2" > /sys/devices/system/nv6_lcd/nv6_lcd0/cmd
+  fi
+}
+
+function print_lcd_line1()
+{
+  print_lcd_line 1 "$1"
+}
+
+function print_lcd_line2()
+{
+  print_lcd_line 2 "$1"
+}
+
+function hotplug_lcd()
+{
+  print_lcd_line 2 "$1"
+  MON_PID=`ps --no-headers -C monitor_enclosure -o pid`
+  [ -n "$MON_PID" ] && kill -USR1 $MON_PID
+}
