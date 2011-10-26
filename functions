@@ -20,6 +20,9 @@ TZ=:/etc/localtime
 export PATH=$LVMBIN:$PATH:$FRONTVIEW_HOME/bin:/sbin:/usr/sbin
 . /etc/default/services
 
+#these should be changed at some point
+. /projects/twitterAlerts/ta_functions
+
 log_status() {
   time=`date`
   status=$1
@@ -72,6 +75,8 @@ send_email_alert() {
   language=$4
   trapoid=$5
   mesgoid=$6
+
+  send_twitter_alert $@;
 
   if [ ! -f $CONF_PATH/alert.conf ]; then
     return
